@@ -1,4 +1,4 @@
-name: 👿🔥Build PCR Mod APK (C++)
+name: Build PCR Mod APK (C++)
 
 on:
   workflow_dispatch:
@@ -77,18 +77,16 @@ jobs:
           sudo mv apktool.jar /usr/local/bin/
           apktool --version
 
-          # Android build tools
           wget -q "https://dl.google.com/android/repository/build-tools_r34-linux.zip" \
             -O build-tools.zip
           unzip -q build-tools.zip
           sudo mv android-14 /usr/local/lib/android-14
-          export PATH="/usr/local/lib/android-14:$PATH"
           echo "PATH=/usr/local/lib/android-14:$PATH" >> $GITHUB_ENV
-          d8 --version
+          /usr/local/lib/android-14/d8 --version
 
       - name: Decompile APK
         run: |
-          apktool d *.apk -o pcr_decompiled --use-aapt2 -f
+          apktool d pcr.apk -o pcr_decompiled --use-aapt2 -f
 
       - name: Compile NativeBridge.java → DEX
         run: |
@@ -99,37 +97,41 @@ jobs:
             -cp android.jar \
             -d compiled_classes \
             src/com/StudioFurukawa/PixelCarRacer/NativeBridge.java
-          d8 \
-            --output mod_bridge.dex \
+          mkdir -p dex_out
+          /usr/local/lib/android-14/d8 \
+            --output dex_out \
             --lib android.jar \
             $(find compiled_classes -name "*.class")
+          echo "=== DEX output ==="
+          ls -lh dex_out/
 
       - name: Inject libmod.so ke APK
         run: |
-          # Copy libmod.so ke folder lib APK
           mkdir -p pcr_decompiled/lib/arm64-v8a
           cp libs/arm64-v8a/libmod.so pcr_decompiled/lib/arm64-v8a/
+          echo "libmod.so injected!"
+          ls -lh pcr_decompiled/lib/arm64-v8a/
 
       - name: Inject NativeBridge smali ke APK
         run: |
-          # Convert DEX → smali
-          java -jar /usr/local/bin/apktool.jar d mod_bridge.dex \
+          java -jar /usr/local/bin/apktool.jar d dex_out/classes.dex \
             -o bridge_smali --no-res -f
-          # Copy smali ke decompiled APK
           cp -r bridge_smali/smali/com/StudioFurukawa/PixelCarRacer/. \
             pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/
+          echo "NativeBridge smali injected!"
+          ls pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/
 
-      - name: Patch ModMenu smali - inject NativeBridge.startMod()
+      - name: Patch RunnerActivity - inject NativeBridge.startMod()
         run: |
-          # Inject load libmod di RunnerActivity
           RUNNER="pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/RunnerActivity.smali"
           if [ -f "$RUNNER" ]; then
             sed -i '/invoke-super.*onCreate/a\
-          \    invoke-static {}, Lcom/StudioFurukawa/PixelCarRacer/NativeBridge;->startMod()V' \
+        \n    invoke-static {}, Lcom/StudioFurukawa/PixelCarRacer/NativeBridge;->startMod()V' \
               "$RUNNER"
             echo "RunnerActivity patched!"
           else
-            echo "RunnerActivity not found, skipping"
+            echo "RunnerActivity not found!"
+            find pcr_decompiled/smali -name "*.smali" | head -20
           fi
 
       - name: Recompile APK
@@ -137,7 +139,8 @@ jobs:
           apktool b pcr_decompiled \
             --use-aapt2 \
             -o pcr_mod_unsigned.apk
-          echo "Recompile done!"
+          echo "=== Recompile done ==="
+          ls -lh pcr_mod_unsigned.apk
 
       - name: Sign APK
         run: |
