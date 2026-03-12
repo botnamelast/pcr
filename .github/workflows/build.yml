@@ -61,10 +61,10 @@ jobs:
 
       - name: Download APK ori
         run: |
-          curl -L -o pcr_ori.apk.zip \
+          curl -L -o pcr.apk \
             "https://github.com/botnamelast/pcr-mod/releases/download/kontol/pcr.apk.zip"
-          unzip pcr_ori.apk.zip
-          ls *.apk
+          file pcr.apk
+          ls -lh pcr.apk
 
       - name: Install tools
         run: |
