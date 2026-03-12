@@ -1,4 +1,4 @@
-name: Build PCR Mod APK (C++)
+name: 👿🔥Build PCR Mod APK (C++)
 
 on:
   workflow_dispatch:
@@ -62,7 +62,7 @@ jobs:
       - name: Download APK ori
         run: |
           curl -L -o pcr_ori.apk.zip \
-            "https://github.com/botnamelast/pcr-mod/releases/download/pcrori/pcr_ori.apk.zip"
+            "https://github.com/botnamelast/pcr-mod/releases/download/kontol/pcr.apk.zip"
           unzip pcr_ori.apk.zip
           ls *.apk
 
