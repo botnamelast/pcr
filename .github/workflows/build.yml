@@ -114,10 +114,18 @@ jobs:
 
       - name: Inject NativeBridge smali ke APK
         run: |
-          java -jar /usr/local/bin/apktool.jar d dex_out/classes.dex \
-            -o bridge_smali --no-res -f
-          cp -r bridge_smali/smali/com/StudioFurukawa/PixelCarRacer/. \
+          # Download baksmali
+          curl -L -o baksmali.jar \
+            "https://github.com/JesusFreke/smali/releases/download/v2.5.2/baksmali-2.5.2.jar"
+          
+          # DEX → smali
+          java -jar baksmali.jar d dex_out/classes.dex -o bridge_smali
+          
+          # Copy NativeBridge smali ke decompiled APK
+          mkdir -p pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer
+          cp -r bridge_smali/com/StudioFurukawa/PixelCarRacer/. \
             pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/
+          
           echo "NativeBridge smali injected!"
           ls pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/
 
