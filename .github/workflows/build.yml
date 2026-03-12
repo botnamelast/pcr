@@ -1,8 +1,6 @@
 name: Build PCR Mod APK (C++)
 
 on:
-  push:
-    branches: [ main ]
   workflow_dispatch:
 
 jobs:
@@ -14,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup NDK
         uses: nttld/setup-ndk@v1
@@ -34,7 +32,7 @@ jobs:
           find libs -name "*.so"
 
       - name: Upload libmod.so
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: mod-so
           path: libs/arm64-v8a/libmod.so
@@ -47,16 +45,16 @@ jobs:
     needs: build-so
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Setup Java 17
-        uses: actions/setup-java@v3
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
       - name: Download libmod.so artifact
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: mod-so
           path: libs/arm64-v8a/
@@ -160,7 +158,7 @@ jobs:
           ls -lh pcr_mod_signed.apk
 
       - name: Upload APK
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: pcr-mod-apk
           path: pcr_mod_signed.apk
