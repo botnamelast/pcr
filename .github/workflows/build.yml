@@ -1,4 +1,4 @@
-name: 👿🔥Build PCR Mod APK (C++)
+name: Build PCR Mod APK (C++)
 
 on:
   workflow_dispatch:
@@ -125,9 +125,8 @@ jobs:
         run: |
           RUNNER="pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/RunnerActivity.smali"
           if [ -f "$RUNNER" ]; then
-            sed -i '/invoke-super.*onCreate/a\
-        \n    invoke-static {}, Lcom/StudioFurukawa/PixelCarRacer/NativeBridge;->startMod()V' \
-              "$RUNNER"
+            INJECT='    invoke-static {}, Lcom/StudioFurukawa/PixelCarRacer/NativeBridge;->startMod()V'
+            sed -i "s|invoke-super.*onCreate.*|&\n${INJECT}|" "$RUNNER"
             echo "RunnerActivity patched!"
           else
             echo "RunnerActivity not found!"
