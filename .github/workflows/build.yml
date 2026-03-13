@@ -5,9 +5,6 @@ on:
 
 jobs:
 
-  # ============================================================
-  # JOB 1: Compile C++ → libmod.so via NDK
-  # ============================================================
   build-so:
     runs-on: ubuntu-latest
     steps:
@@ -37,9 +34,6 @@ jobs:
           name: mod-so
           path: libs/arm64-v8a/libmod.so
 
-  # ============================================================
-  # JOB 2: Build APK (inject libmod.so + NativeBridge)
-  # ============================================================
   build-apk:
     runs-on: ubuntu-latest
     needs: build-so
@@ -70,13 +64,11 @@ jobs:
         run: |
           curl -L -o apktool.jar \
             "https://github.com/iBotPeaches/Apktool/releases/download/v2.9.3/apktool_2.9.3.jar"
-          echo '#!/bin/bash' > apktool.sh
-          echo 'java -jar /usr/local/bin/apktool.jar "$@"' >> apktool.sh
+          printf '#!/bin/bash\njava -jar /usr/local/bin/apktool.jar "$@"\n' > apktool.sh
           chmod +x apktool.sh
           sudo mv apktool.sh /usr/local/bin/apktool
           sudo mv apktool.jar /usr/local/bin/
           apktool --version
-
           wget -q "https://dl.google.com/android/repository/build-tools_r34-linux.zip" \
             -O build-tools.zip
           unzip -q build-tools.zip
@@ -113,43 +105,17 @@ jobs:
           echo "libmod.so injected!"
           ls -lh pcr_decompiled/lib/arm64-v8a/
 
-      - name: Inject NativeBridge sebagai classes2.dex
+      - name: Inject DEX sebagai classes2.dex
         run: |
           cp dex_out/classes.dex pcr_decompiled/classes2.dex
           echo "classes2.dex injected!"
           ls pcr_decompiled/classes*.dex 2>/dev/null || ls pcr_decompiled/
 
-      - name: Patch RunnerActivity - start ModOverlay service
-        run: |
-          RUNNER="pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/RunnerActivity.smali"
-          if [ -f "$RUNNER" ]; then
-            # Inject startService(ModOverlay) after super.onCreate()
-            # Smali: Intent i = new Intent(this, ModOverlay.class); startService(i)
-            INJECT=$(cat << 'SMALI'
-    new-instance v0, Landroid/content/Intent;
-    invoke-direct {v0, p0, v0}, Landroid/content/Intent;-><init>(Landroid/content/Context;Ljava/lang/Class;)V
-    const-class v1, Lcom/StudioFurukawa/PixelCarRacer/ModOverlay;
-    invoke-direct {v0, p0, v1}, Landroid/content/Intent;-><init>(Landroid/content/Context;Ljava/lang/Class;)V
-    invoke-virtual {p0, v0}, Lcom/StudioFurukawa/PixelCarRacer/RunnerActivity;->startService(Landroid/content/Intent;)Landroid/content/ComponentName;
-SMALI
-            )
-            sed -i "s|invoke-super.*onCreate.*|&\n${INJECT}|" "$RUNNER"
-            echo "RunnerActivity patched!"
-            grep -A8 "invoke-super.*onCreate" "$RUNNER" | head -15
-          else
-            echo "RunnerActivity not found!"
-            find pcr_decompiled/smali -name "*.smali" | head -20
-          fi
+      - name: Patch RunnerActivity
+        run: python3 scripts/patch_runner.py pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/RunnerActivity.smali
 
-      - name: Patch AndroidManifest - add ModOverlay service + permission
-        run: |
-          MANIFEST="pcr_decompiled/AndroidManifest.xml"
-          # Add SYSTEM_ALERT_WINDOW permission
-          sed -i 's|<application|<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\n    <application|' "$MANIFEST"
-          # Add ModOverlay service declaration before </application>
-          sed -i 's|</application>|    <service android:name="com.StudioFurukawa.PixelCarRacer.ModOverlay" android:enabled="true" android:exported="false"/>\n    </application>|' "$MANIFEST"
-          echo "Manifest patched!"
-          grep -E "SYSTEM_ALERT|ModOverlay" "$MANIFEST"
+      - name: Patch AndroidManifest
+        run: python3 scripts/patch_manifest.py pcr_decompiled/AndroidManifest.xml
 
       - name: Recompile APK
         run: |
@@ -162,10 +128,8 @@ SMALI
       - name: Sign APK
         run: |
           echo "${{ secrets.KEYSTORE_B64 }}" | base64 -d > mod.keystore
-
           /usr/local/lib/android-14/zipalign \
             -v -p 4 pcr_mod_unsigned.apk pcr_mod_aligned.apk
-
           /usr/local/lib/android-14/apksigner sign \
             --ks mod.keystore \
             --ks-pass pass:${{ secrets.KEYSTORE_PASS }} \
@@ -173,7 +137,6 @@ SMALI
             --key-pass pass:${{ secrets.KEYSTORE_PASS }} \
             --out pcr_mod_signed.apk \
             pcr_mod_aligned.apk
-
           echo "=== APK signed ==="
           ls -lh pcr_mod_signed.apk
 
