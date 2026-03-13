@@ -1,4 +1,4 @@
-package com.pcrmod;
+package com.StudioFurukawa.PixelCarRacer;
 
 import android.app.Service;
 import android.content.Intent;
