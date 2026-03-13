@@ -1,4 +1,4 @@
-name: Build PCR Mod APK (C++)
+name: 👿🤖Build PCR Mod APK (C++)
 
 on:
   workflow_dispatch:
@@ -38,7 +38,7 @@ jobs:
           path: libs/arm64-v8a/libmod.so
 
   # ============================================================
-  # JOB 2: Build APK (inject libmod.so + NativeBridge.java)
+  # JOB 2: Build APK (inject libmod.so + NativeBridge)
   # ============================================================
   build-apk:
     runs-on: ubuntu-latest
@@ -88,7 +88,7 @@ jobs:
         run: |
           apktool d pcr.apk -o pcr_decompiled --use-aapt2 -f
 
-      - name: Compile NativeBridge.java → DEX
+      - name: Compile NativeBridge.java -> DEX
         run: |
           curl -L -o android.jar \
             "https://github.com/Reginer/aosp-android-jar/raw/main/android-33/android.jar"
@@ -112,22 +112,11 @@ jobs:
           echo "libmod.so injected!"
           ls -lh pcr_decompiled/lib/arm64-v8a/
 
-      - name: Inject NativeBridge smali ke APK
+      - name: Inject NativeBridge sebagai classes2.dex
         run: |
-          # Download baksmali
-          curl -L -o baksmali.jar \
-            "https://github.com/JesusFreke/smali/releases/download/v2.5.2/baksmali-2.5.2.jar"
-          
-          # DEX → smali
-          java -jar baksmali.jar d dex_out/classes.dex -o bridge_smali
-          
-          # Copy NativeBridge smali ke decompiled APK
-          mkdir -p pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer
-          cp -r bridge_smali/com/StudioFurukawa/PixelCarRacer/. \
-            pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/
-          
-          echo "NativeBridge smali injected!"
-          ls pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/
+          cp dex_out/classes.dex pcr_decompiled/classes2.dex
+          echo "classes2.dex injected!"
+          ls pcr_decompiled/classes*.dex 2>/dev/null || ls pcr_decompiled/
 
       - name: Patch RunnerActivity - inject NativeBridge.startMod()
         run: |
@@ -136,6 +125,7 @@ jobs:
             INJECT='    invoke-static {}, Lcom/StudioFurukawa/PixelCarRacer/NativeBridge;->startMod()V'
             sed -i "s|invoke-super.*onCreate.*|&\n${INJECT}|" "$RUNNER"
             echo "RunnerActivity patched!"
+            grep -A2 "invoke-super.*onCreate" "$RUNNER" | head -10
           else
             echo "RunnerActivity not found!"
             find pcr_decompiled/smali -name "*.smali" | head -20
