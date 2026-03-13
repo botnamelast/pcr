@@ -131,12 +131,15 @@ static bool initSymbols() {
     g_desc_nos     = (GMS2VarDesc*) dlsym(lib, "g_VAR_nos_enabled");
 
     // Baca slot dari descriptor
-    if (g_desc_RPM)     g_slot_RPM     = g_desc_RPM->slot;
-    if (g_desc_gear)    g_slot_gear    = g_desc_gear->slot;
-    if (g_desc_speed)   g_slot_speed   = g_desc_speed->slot;
-    if (g_desc_shiftup) g_slot_shiftup = g_desc_shiftup->slot;
-    if (g_desc_shiftdn) g_slot_shiftdn = g_desc_shiftdn->slot;
-    if (g_desc_nos)     g_slot_nos     = g_desc_nos->slot;
+    // GMS2 variable ID base = 100000 (0x186a0)
+    // Slot = ID - 100000
+    const int32_t GMS2_VAR_BASE = 100000;
+    if (g_desc_RPM)     g_slot_RPM     = g_desc_RPM->slot - GMS2_VAR_BASE;
+    if (g_desc_gear)    g_slot_gear    = g_desc_gear->slot - GMS2_VAR_BASE;
+    if (g_desc_speed)   g_slot_speed   = g_desc_speed->slot - GMS2_VAR_BASE;
+    if (g_desc_shiftup) g_slot_shiftup = g_desc_shiftup->slot - GMS2_VAR_BASE;
+    if (g_desc_shiftdn) g_slot_shiftdn = g_desc_shiftdn->slot - GMS2_VAR_BASE;
+    if (g_desc_nos)     g_slot_nos     = g_desc_nos->slot - GMS2_VAR_BASE;
 
     LOGI("slots: RPM=%d gear=%d speed=%d shiftup=%d shiftdn=%d nos=%d",
          g_slot_RPM, g_slot_gear, g_slot_speed,
@@ -200,7 +203,7 @@ static void tick() {
 // ============================================================
 static void* modThread(void*) {
     LOGI("Mod thread starting...");
-    sleep(8);
+    sleep(5);
     if (!initSymbols()) { LOGI("initSymbols FAILED"); return nullptr; }
     // Tunggu game fully loaded sebelum akses variable
     LOGI("Waiting for game to fully load...");
