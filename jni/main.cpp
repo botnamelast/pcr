@@ -1,282 +1,261 @@
 #include <jni.h>
-#include <dlfcn.h>
-#include <unistd.h>
-#include <pthread.h>
 #include <android/log.h>
-#include <stdint.h>
+#include <dlfcn.h>
+#include <pthread.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#include <errno.h>
+#include <atomic>
+#include <cmath>
+#include <cstdint>
 
-#define TAG       "PCRMOD"
-#define TAG_RPM   "PCRMOD_RPM"
-#define TAG_SHIFT "PCRMOD_SHIFT"
-
-#define LOGI(...) __android_log_print(ANDROID_LOG_DEBUG, TAG,       __VA_ARGS__)
-#define LRPM(...) __android_log_print(ANDROID_LOG_DEBUG, TAG_RPM,   __VA_ARGS__)
-#define LSFT(...) __android_log_print(ANDROID_LOG_DEBUG, TAG_SHIFT,  __VA_ARGS__)
+#define TAG "PCRMOD"
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
 // ============================================================
-// GMS2 RValue
+//  GMS2 Types
 // ============================================================
 struct RValue {
     union {
-        double  val;
+        double  real;
         int32_t i32;
         void*   ptr;
     };
-    int32_t flags;  // offset 8
-    int32_t kind;   // offset 12  (0=real, 1=string, 2=array)
+    int32_t  flags;
+    uint32_t kind;   // 0=real/double
 };
 
-// ============================================================
-// GMS2 Variable Descriptor (g_VAR_xxx = 16 bytes)
-// offset 8 = slot index
-// ============================================================
-struct GMS2VarDesc {
+struct VarDescriptor {
     int32_t hash;
     int32_t type;
-    int32_t slot;   // ← index ke global variable array
-    int32_t flags;
+    int32_t slot;    // raw ID (actual_slot + 100000)
+    int32_t pad;
 };
 
 // ============================================================
-// Function pointers — dari readelf
-// _Z22Variable_Global_GetVariiP6RValuebb @ 0x9fd4c4
-// _Z22Variable_Global_SetVariiP6RValue   @ 0x9fd408
+//  Globals
 // ============================================================
-typedef void (*FnGetVar)(int slot, int unk, RValue* out, bool b1, bool b2);
-typedef void (*FnSetVar)(int slot, int unk, RValue* val);
+static void*     g_libyoyo   = nullptr;
+static uintptr_t g_base      = 0;
 
-static FnGetVar g_fnGetVar = nullptr;
-static FnSetVar g_fnSetVar = nullptr;
+static VarDescriptor* g_desc_RPM = nullptr;
+static int32_t        g_slot_RPM = -1;
 
-// ============================================================
-// Descriptors & slots
-// ============================================================
-static GMS2VarDesc* g_desc_RPM      = nullptr;
-static GMS2VarDesc* g_desc_gear     = nullptr;
-static GMS2VarDesc* g_desc_speed    = nullptr;
-static GMS2VarDesc* g_desc_shiftup  = nullptr;
-static GMS2VarDesc* g_desc_shiftdn  = nullptr;
-static GMS2VarDesc* g_desc_nos      = nullptr;
+static constexpr int32_t GMS2_VAR_BASE = 100000;
 
-static int32_t g_slot_RPM     = -1;
-static int32_t g_slot_gear    = -1;
-static int32_t g_slot_speed   = -1;
-static int32_t g_slot_shiftup = -1;
-static int32_t g_slot_shiftdn = -1;
-static int32_t g_slot_nos     = -1;
+static std::atomic<double> g_rpm_value{0.0};
 
-// Mod state
-static bool  g_AutoShift     = false;
-static float g_ShiftRPM      = 9300.0f;
-static int   g_ShiftMode     = 0;
-static float g_Shift1to2     = 9300.0f;
-static float g_Shift2to3     = 9400.0f;
-static float g_Shift3to4     = 9400.0f;
-static float g_Shift4to5     = 9500.0f;
-static float g_Shift5to6     = 9500.0f;
-
-static bool  g_RaceStarted   = false;
-static int   g_PrevGear      = 0;
-static long  g_LastShiftTime = 0;
-static long  g_LastRpmLog    = 0;
-
-static pthread_t g_Thread;
-static bool g_ThreadRunning  = false;
+enum RPMSource { SRC_NONE, SRC_VTABLE, SRC_CINSTANCE };
+static std::atomic<int>  g_rpm_source{SRC_NONE};
+static std::atomic<bool> g_vtable_hook_enabled{false};
+static std::atomic<bool> g_cinstance_read_enabled{false};
+static std::atomic<bool> g_mod_running{false};
 
 // ============================================================
-// Read / Write via official GMS2 functions
+//  APPROACH 1: VTABLE HOOK
 // ============================================================
-static bool g_globalReady = false;
+typedef RValue* (*GetVarFn)(void* instance, int32_t varId);
+static GetVarFn  g_original_GetVar    = nullptr;
+static void**    g_vtable_patch_entry = nullptr;
 
-static double readVar(int32_t slot) {
-    if (!g_fnGetVar || slot < 0 || !g_globalReady) return 0.0;
-    RValue out = {};
-    g_fnGetVar(slot, 0, &out, false, false);
-    return out.val;
+static RValue* hooked_GetVar(void* instance, int32_t varId) {
+    RValue* result = g_original_GetVar(instance, varId);
+    if (g_vtable_hook_enabled.load(std::memory_order_relaxed)) {
+        if (varId == 102586 && result) {
+            double val = result->real;
+            if (val >= 0.0 && val <= 25000.0) {
+                g_rpm_value.store(val, std::memory_order_relaxed);
+                g_rpm_source.store(SRC_VTABLE, std::memory_order_relaxed);
+            }
+        }
+    }
+    return result;
 }
 
-static void writeVar(int32_t slot, double val) {
-    if (!g_fnSetVar || slot < 0) return;
-    RValue rv = {};
-    rv.val  = val;
-    rv.kind = 0;
-    g_fnSetVar(slot, 0, &rv);
+static bool installVtableHook(void* cinstance_ptr) {
+    if (!cinstance_ptr) return false;
+    void** vtable = *reinterpret_cast<void***>(cinstance_ptr);
+    if (!vtable) return false;
+
+    g_vtable_patch_entry = &vtable[2];
+    g_original_GetVar    = reinterpret_cast<GetVarFn>(vtable[2]);
+
+    uintptr_t page = reinterpret_cast<uintptr_t>(g_vtable_patch_entry) & ~(uintptr_t)4095;
+    if (mprotect(reinterpret_cast<void*>(page), 8192,
+                 PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+        LOGE("vtable mprotect failed: %s", strerror(errno));
+        return false;
+    }
+    *g_vtable_patch_entry = reinterpret_cast<void*>(hooked_GetVar);
+    LOGI("Vtable hook installed, original=0x%lx", (uintptr_t)g_original_GetVar);
+    return true;
 }
 
-static float getRPM()   { return (float)readVar(g_slot_RPM); }
-static int   getGear()  { return (int)  readVar(g_slot_gear); }
-static float getSpeed() { return (float)readVar(g_slot_speed); }
+static void removeVtableHook() {
+    if (!g_vtable_patch_entry || !g_original_GetVar) return;
+    *g_vtable_patch_entry = reinterpret_cast<void*>(g_original_GetVar);
+    g_original_GetVar    = nullptr;
+    g_vtable_patch_entry = nullptr;
+    LOGI("Vtable hook removed");
+}
 
 // ============================================================
-// Init
+//  APPROACH 2: CINSTANCE DIRECT READ
+// ============================================================
+static std::atomic<uintptr_t> g_vars_array_ptr{0};
+
+static bool tryUpdateVarsArray() {
+    if (!g_base) return false;
+    uintptr_t* pptr = reinterpret_cast<uintptr_t*>(g_base + 0x15b92f8);
+    if (!*pptr) return false;
+    uintptr_t global_obj = *reinterpret_cast<uintptr_t*>(*pptr);
+    if (!global_obj) return false;
+    int32_t flag = *reinterpret_cast<int32_t*>(global_obj + 0x6c);
+    if (!flag) return false;
+    uintptr_t vars = *reinterpret_cast<uintptr_t*>(global_obj + 0x8);
+    if (!vars) return false;
+    g_vars_array_ptr.store(vars, std::memory_order_relaxed);
+    return true;
+}
+
+static void readRPM_CInstance() {
+    if (!g_cinstance_read_enabled.load(std::memory_order_relaxed)) return;
+    uintptr_t vars = g_vars_array_ptr.load(std::memory_order_relaxed);
+    if (!vars) { tryUpdateVarsArray(); return; }
+    if (g_slot_RPM < 0) return;
+    RValue* rv = reinterpret_cast<RValue*>(vars + g_slot_RPM * 16);
+    if (rv->kind != 0 && rv->kind != 0xFFFFFF) return;
+    double val = rv->real;
+    if (val >= 0.0 && val <= 25000.0) {
+        g_rpm_value.store(val, std::memory_order_relaxed);
+        g_rpm_source.store(SRC_CINSTANCE, std::memory_order_relaxed);
+    }
+}
+
+// ============================================================
+//  INIT
 // ============================================================
 static bool initSymbols() {
-    void* lib = dlopen("libyoyo.so", RTLD_NOW | RTLD_GLOBAL);
-    if (!lib) lib = dlopen("/data/app/com.StudioFurukawa.PixelCarRacer/lib/arm64/libyoyo.so",
-                           RTLD_NOW | RTLD_GLOBAL);
-    if (!lib) { LOGI("dlopen FAILED: %s", dlerror()); return false; }
-    LOGI("dlopen OK: %p", lib);
-
-    // Fungsi getter/setter
-    g_fnGetVar = (FnGetVar) dlsym(lib, "_Z22Variable_Global_GetVariiP6RValuebb");
-    g_fnSetVar = (FnSetVar) dlsym(lib, "_Z22Variable_Global_SetVariiP6RValue");
-    LOGI("fnGetVar=%p fnSetVar=%p", g_fnGetVar, g_fnSetVar);
-
-    // Descriptors
-    g_desc_RPM     = (GMS2VarDesc*) dlsym(lib, "g_VAR_RPM");
-    g_desc_gear    = (GMS2VarDesc*) dlsym(lib, "g_VAR_currentgear");
-    g_desc_speed   = (GMS2VarDesc*) dlsym(lib, "g_VAR_car_speed");
-    g_desc_shiftup = (GMS2VarDesc*) dlsym(lib, "g_VAR_vk_Shiftup");
-    g_desc_shiftdn = (GMS2VarDesc*) dlsym(lib, "g_VAR_vk_Shiftdown");
-    g_desc_nos     = (GMS2VarDesc*) dlsym(lib, "g_VAR_nos_enabled");
-
-    // Baca slot dari descriptor
-    // GMS2 variable ID base = 100000 (0x186a0)
-    // Slot = ID - 100000
-    const int32_t GMS2_VAR_BASE = 100000;
-    if (g_desc_RPM)     g_slot_RPM     = g_desc_RPM->slot - GMS2_VAR_BASE;
-    if (g_desc_gear)    g_slot_gear    = g_desc_gear->slot - GMS2_VAR_BASE;
-    if (g_desc_speed)   g_slot_speed   = g_desc_speed->slot - GMS2_VAR_BASE;
-    if (g_desc_shiftup) g_slot_shiftup = g_desc_shiftup->slot - GMS2_VAR_BASE;
-    if (g_desc_shiftdn) g_slot_shiftdn = g_desc_shiftdn->slot - GMS2_VAR_BASE;
-    if (g_desc_nos)     g_slot_nos     = g_desc_nos->slot - GMS2_VAR_BASE;
-
-    LOGI("slots: RPM=%d gear=%d speed=%d shiftup=%d shiftdn=%d nos=%d",
-         g_slot_RPM, g_slot_gear, g_slot_speed,
-         g_slot_shiftup, g_slot_shiftdn, g_slot_nos);
-
-    return g_fnGetVar != nullptr && g_fnSetVar != nullptr && g_desc_RPM != nullptr;
-}
-
-static long currentTimeMs() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
-}
-
-static float getTargetRPM(int gear) {
-    if (g_ShiftMode == 0) return g_ShiftRPM;
-    switch (gear) {
-        case 1: return g_Shift1to2;
-        case 2: return g_Shift2to3;
-        case 3: return g_Shift3to4;
-        case 4: return g_Shift4to5;
-        case 5: return g_Shift5to6;
-        default: return g_ShiftRPM;
+    g_libyoyo = dlopen("libyoyo.so", RTLD_NOW | RTLD_GLOBAL);
+    if (!g_libyoyo) {
+        LOGE("dlopen libyoyo failed: %s", dlerror());
+        return false;
     }
+
+    void* sym = dlsym(g_libyoyo, "g_VAR_RPM");
+    if (!sym) { LOGE("g_VAR_RPM not found"); return false; }
+
+    Dl_info info;
+    dladdr(sym, &info);
+    g_base = reinterpret_cast<uintptr_t>(info.dli_fbase);
+    LOGI("libyoyo base: 0x%lx", g_base);
+
+    g_desc_RPM = reinterpret_cast<VarDescriptor*>(sym);
+
+    sleep(3);
+    g_slot_RPM = g_desc_RPM->slot - GMS2_VAR_BASE;
+    LOGI("RPM slot raw=%d actual=%d", g_desc_RPM->slot, g_slot_RPM);
+
+    tryUpdateVarsArray();
+    LOGI("vars_array=0x%lx", (uintptr_t)g_vars_array_ptr.load());
+    return true;
 }
 
 // ============================================================
-// Tick
-// ============================================================
-static void tick() {
-    long  now   = currentTimeMs();
-    float rpm   = getRPM();
-    int   gear  = getGear();
-    float speed = getSpeed();
-
-    if (now - g_LastRpmLog >= 500) {
-        LRPM("RPM=%.1f GEAR=%d SPEED=%.1f", rpm, gear, speed);
-        g_LastRpmLog = now;
-    }
-
-    if (gear == 1 && g_PrevGear == 0) { g_RaceStarted = true;  LOGI("RACE START"); }
-    if (gear == 0 && g_RaceStarted)   { g_RaceStarted = false; LOGI("RACE END"); }
-    g_PrevGear = gear;
-
-    if (!g_AutoShift || !g_RaceStarted) return;
-    if (gear < 1 || gear >= 6) return;
-    if (now - g_LastShiftTime < 300) return;
-
-    float target = getTargetRPM(gear);
-    if (rpm >= target) {
-        LSFT("SHIFT UP! rpm=%.0f gear=%d target=%.0f", rpm, gear, target);
-        writeVar(g_slot_shiftup, 1.0);
-        g_LastShiftTime = now;
-        usleep(50000);
-        writeVar(g_slot_shiftup, 0.0);
-    }
-}
-
-// ============================================================
-// Mod thread
+//  MOD THREAD
 // ============================================================
 static void* modThread(void*) {
-    LOGI("Mod thread starting...");
-    sleep(5);
-    if (!initSymbols()) { LOGI("initSymbols FAILED"); return nullptr; }
-    // Tunggu game fully loaded sebelum akses variable
-    LOGI("Waiting for game to fully load...");
-    sleep(5);
-    g_globalReady = true;
     LOGI("Mod thread running!");
-    while (g_ThreadRunning) {
-        tick();
-        usleep(16000);
+    if (!initSymbols()) { LOGE("init failed"); return nullptr; }
+
+    int tick = 0;
+    while (g_mod_running.load()) {
+        readRPM_CInstance();
+        if (++tick % 20 == 0) { tryUpdateVarsArray(); tick = 0; }
+        usleep(50000);
     }
-    LOGI("Mod thread stopped!");
+    LOGI("Mod thread exit");
     return nullptr;
 }
 
 // ============================================================
-// JNI
+//  JNI — package: com.StudioFurukawa.PixelCarRacer
 // ============================================================
+#define JNI_FN(name) \
+    Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_##name
+
 extern "C" {
 
-JNIEXPORT void JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_startMod(JNIEnv*, jclass) {
-    if (g_ThreadRunning) return;
-    g_ThreadRunning = true;
-    pthread_create(&g_Thread, nullptr, modThread, nullptr);
-    LOGI("startMod called!");
+JNIEXPORT void JNICALL JNI_FN(startMod)(JNIEnv*, jclass) {
+    if (g_mod_running.load()) return;
+    g_mod_running.store(true);
+    pthread_t t;
+    pthread_create(&t, nullptr, modThread, nullptr);
+    pthread_detach(t);
+    LOGI("startMod called");
 }
 
-JNIEXPORT void JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_stopMod(JNIEnv*, jclass) {
-    g_ThreadRunning = false;
+JNIEXPORT void JNICALL JNI_FN(stopMod)(JNIEnv*, jclass) {
+    g_mod_running.store(false);
+    removeVtableHook();
+    g_vtable_hook_enabled.store(false);
+    g_cinstance_read_enabled.store(false);
+    g_rpm_source.store(SRC_NONE, std::memory_order_relaxed);
+    LOGI("stopMod called");
 }
 
-JNIEXPORT void JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_setAutoShift(JNIEnv*, jclass, jboolean v) {
-    g_AutoShift = v;
-    LOGI("setAutoShift: %d", (int)v);
+JNIEXPORT jfloat JNICALL JNI_FN(getRPM)(JNIEnv*, jclass) {
+    return (jfloat)g_rpm_value.load(std::memory_order_relaxed);
 }
 
-JNIEXPORT void JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_setShiftRPM(JNIEnv*, jclass, jfloat rpm) {
-    g_ShiftRPM = rpm;
+JNIEXPORT jstring JNICALL JNI_FN(getRPMSource)(JNIEnv* env, jclass) {
+    switch (g_rpm_source.load(std::memory_order_relaxed)) {
+        case SRC_VTABLE:    return env->NewStringUTF("vtable");
+        case SRC_CINSTANCE: return env->NewStringUTF("cinstance");
+        default:            return env->NewStringUTF("none");
+    }
 }
 
-JNIEXPORT void JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_setShiftMode(JNIEnv*, jclass, jint mode) {
-    g_ShiftMode = mode;
+JNIEXPORT void JNICALL JNI_FN(setVtableHook)(JNIEnv*, jclass, jboolean enable) {
+    if (enable) {
+        if (!g_base) { LOGE("setVtableHook: not init yet"); return; }
+        uintptr_t* ci_ptr = reinterpret_cast<uintptr_t*>(g_base + 0x15b92e8);
+        void* ci = reinterpret_cast<void*>(*ci_ptr);
+        if (ci && !g_original_GetVar) {
+            if (installVtableHook(ci)) {
+                g_vtable_hook_enabled.store(true);
+                g_cinstance_read_enabled.store(false);
+            }
+        } else { LOGE("setVtableHook: no CInstance or already hooked"); }
+    } else {
+        g_vtable_hook_enabled.store(false);
+        removeVtableHook();
+        if (g_rpm_source.load() == SRC_VTABLE)
+            g_rpm_source.store(SRC_NONE, std::memory_order_relaxed);
+    }
 }
 
-JNIEXPORT void JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_setManualRPMs(JNIEnv*, jclass,
-        jfloat r12, jfloat r23, jfloat r34, jfloat r45, jfloat r56) {
-    g_Shift1to2=r12; g_Shift2to3=r23; g_Shift3to4=r34;
-    g_Shift4to5=r45; g_Shift5to6=r56;
+JNIEXPORT void JNICALL JNI_FN(setCInstanceRead)(JNIEnv*, jclass, jboolean enable) {
+    g_cinstance_read_enabled.store(enable);
+    if (enable) {
+        g_vtable_hook_enabled.store(false);
+        removeVtableHook();
+        tryUpdateVarsArray();
+        LOGI("CInstance read ON, vars=0x%lx", (uintptr_t)g_vars_array_ptr.load());
+    } else {
+        if (g_rpm_source.load() == SRC_CINSTANCE)
+            g_rpm_source.store(SRC_NONE, std::memory_order_relaxed);
+    }
 }
 
-JNIEXPORT void JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_setNOS(JNIEnv*, jclass, jboolean v) {
-    writeVar(g_slot_nos, v ? 1.0 : 0.0);
-}
-
-JNIEXPORT jfloat JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_getRPM(JNIEnv*, jclass) {
-    return getRPM();
-}
-
-JNIEXPORT jint JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_getGear(JNIEnv*, jclass) {
-    return getGear();
-}
-
-JNIEXPORT jboolean JNICALL
-Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_isRaceStarted(JNIEnv*, jclass) {
-    return g_RaceStarted;
-}
+JNIEXPORT void JNICALL JNI_FN(setAutoShift)(JNIEnv*, jclass, jboolean) {}
+JNIEXPORT void JNICALL JNI_FN(setShiftRPM)(JNIEnv*, jclass, jfloat) {}
+JNIEXPORT void JNICALL JNI_FN(setShiftMode)(JNIEnv*, jclass, jint) {}
+JNIEXPORT void JNICALL JNI_FN(setManualRPMs)(JNIEnv*, jclass, jfloat, jfloat, jfloat, jfloat, jfloat) {}
+JNIEXPORT void JNICALL JNI_FN(setNOS)(JNIEnv*, jclass, jboolean) {}
+JNIEXPORT jint JNICALL JNI_FN(getGear)(JNIEnv*, jclass) { return 0; }
+JNIEXPORT jboolean JNICALL JNI_FN(isRaceStarted)(JNIEnv*, jclass) { return JNI_FALSE; }
 
 } // extern "C"
