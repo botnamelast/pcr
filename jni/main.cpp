@@ -86,8 +86,10 @@ static bool g_ThreadRunning  = false;
 // ============================================================
 // Read / Write via official GMS2 functions
 // ============================================================
+static bool g_globalReady = false;
+
 static double readVar(int32_t slot) {
-    if (!g_fnGetVar || slot < 0) return 0.0;
+    if (!g_fnGetVar || slot < 0 || !g_globalReady) return 0.0;
     RValue out = {};
     g_fnGetVar(slot, 0, &out, false, false);
     return out.val;
@@ -198,8 +200,12 @@ static void tick() {
 // ============================================================
 static void* modThread(void*) {
     LOGI("Mod thread starting...");
-    sleep(3);
+    sleep(8);
     if (!initSymbols()) { LOGI("initSymbols FAILED"); return nullptr; }
+    // Tunggu game fully loaded sebelum akses variable
+    LOGI("Waiting for game to fully load...");
+    sleep(5);
+    g_globalReady = true;
     LOGI("Mod thread running!");
     while (g_ThreadRunning) {
         tick();
