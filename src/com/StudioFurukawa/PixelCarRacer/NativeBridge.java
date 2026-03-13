@@ -33,8 +33,15 @@ public class NativeBridge {
     // === NOS ===
     public static native void setNOS(boolean val);
 
-    // === Read game values (untuk debug display di ModMenu) ===
+    // === Read game values ===
     public static native float getRPM();
     public static native int   getGear();
     public static native boolean isRaceStarted();
+
+    // === RPM source debug ===
+    public static native String getRPMSource(); // "vtable", "cinstance", "none"
+
+    // === Hook toggles ===
+    public static native void setVtableHook(boolean enable);
+    public static native void setCInstanceRead(boolean enable);
 }
