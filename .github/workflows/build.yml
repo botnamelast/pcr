@@ -1,4 +1,4 @@
-name: 👿🤖Build PCR Mod APK (C++)
+name: Build PCR Mod APK (C++)
 
 on:
   workflow_dispatch:
@@ -88,7 +88,7 @@ jobs:
         run: |
           apktool d pcr.apk -o pcr_decompiled --use-aapt2 -f
 
-      - name: Compile NativeBridge.java -> DEX
+      - name: Compile Java files -> DEX
         run: |
           curl -L -o android.jar \
             "https://github.com/Reginer/aosp-android-jar/raw/main/android-33/android.jar"
@@ -96,7 +96,8 @@ jobs:
           javac -source 8 -target 8 \
             -cp android.jar \
             -d compiled_classes \
-            src/com/StudioFurukawa/PixelCarRacer/NativeBridge.java
+            src/com/StudioFurukawa/PixelCarRacer/NativeBridge.java \
+            src/com/StudioFurukawa/PixelCarRacer/ModOverlay.java
           mkdir -p dex_out
           /usr/local/lib/android-14/d8 \
             --output dex_out \
@@ -118,18 +119,37 @@ jobs:
           echo "classes2.dex injected!"
           ls pcr_decompiled/classes*.dex 2>/dev/null || ls pcr_decompiled/
 
-      - name: Patch RunnerActivity - inject NativeBridge.startMod()
+      - name: Patch RunnerActivity - start ModOverlay service
         run: |
           RUNNER="pcr_decompiled/smali/com/StudioFurukawa/PixelCarRacer/RunnerActivity.smali"
           if [ -f "$RUNNER" ]; then
-            INJECT='    invoke-static {}, Lcom/StudioFurukawa/PixelCarRacer/NativeBridge;->startMod()V'
+            # Inject startService(ModOverlay) after super.onCreate()
+            # Smali: Intent i = new Intent(this, ModOverlay.class); startService(i)
+            INJECT=$(cat << 'SMALI'
+    new-instance v0, Landroid/content/Intent;
+    invoke-direct {v0, p0, v0}, Landroid/content/Intent;-><init>(Landroid/content/Context;Ljava/lang/Class;)V
+    const-class v1, Lcom/StudioFurukawa/PixelCarRacer/ModOverlay;
+    invoke-direct {v0, p0, v1}, Landroid/content/Intent;-><init>(Landroid/content/Context;Ljava/lang/Class;)V
+    invoke-virtual {p0, v0}, Lcom/StudioFurukawa/PixelCarRacer/RunnerActivity;->startService(Landroid/content/Intent;)Landroid/content/ComponentName;
+SMALI
+            )
             sed -i "s|invoke-super.*onCreate.*|&\n${INJECT}|" "$RUNNER"
             echo "RunnerActivity patched!"
-            grep -A2 "invoke-super.*onCreate" "$RUNNER" | head -10
+            grep -A8 "invoke-super.*onCreate" "$RUNNER" | head -15
           else
             echo "RunnerActivity not found!"
             find pcr_decompiled/smali -name "*.smali" | head -20
           fi
+
+      - name: Patch AndroidManifest - add ModOverlay service + permission
+        run: |
+          MANIFEST="pcr_decompiled/AndroidManifest.xml"
+          # Add SYSTEM_ALERT_WINDOW permission
+          sed -i 's|<application|<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>\n    <application|' "$MANIFEST"
+          # Add ModOverlay service declaration before </application>
+          sed -i 's|</application>|    <service android:name="com.StudioFurukawa.PixelCarRacer.ModOverlay" android:enabled="true" android:exported="false"/>\n    </application>|' "$MANIFEST"
+          echo "Manifest patched!"
+          grep -E "SYSTEM_ALERT|ModOverlay" "$MANIFEST"
 
       - name: Recompile APK
         run: |
