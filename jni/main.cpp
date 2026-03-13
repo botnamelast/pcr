@@ -4,27 +4,68 @@
 #include <pthread.h>
 #include <android/log.h>
 #include <stdint.h>
-#include <math.h>
 
-#define TAG      "PCRMOD"
-#define TAG_RPM  "PCRMOD_RPM"
-#define TAG_SCAN "PCRMOD_SCAN"
+#define TAG       "PCRMOD"
+#define TAG_RPM   "PCRMOD_RPM"
+#define TAG_SHIFT "PCRMOD_SHIFT"
 
-#define LOGI(...) __android_log_print(ANDROID_LOG_DEBUG, TAG,      __VA_ARGS__)
-#define LRPM(...) __android_log_print(ANDROID_LOG_DEBUG, TAG_RPM,  __VA_ARGS__)
-#define LSCN(...) __android_log_print(ANDROID_LOG_DEBUG, TAG_SCAN, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_DEBUG, TAG,       __VA_ARGS__)
+#define LRPM(...) __android_log_print(ANDROID_LOG_DEBUG, TAG_RPM,   __VA_ARGS__)
+#define LSFT(...) __android_log_print(ANDROID_LOG_DEBUG, TAG_SHIFT,  __VA_ARGS__)
 
 // ============================================================
-// g_VAR_xxx = pointer ke sesuatu. Kita scan offset 0,8,16,24,32
-// untuk cari double yang nilainya masuk akal (RPM: 0-12000)
+// GMS2 RValue
 // ============================================================
-static void** g_RPM_pp         = nullptr;
-static void** g_CurrentGear_pp = nullptr;
-static void** g_CarSpeed_pp    = nullptr;
-static void** g_VkShiftUp_pp   = nullptr;
-static void** g_VkShiftDown_pp = nullptr;
-static void** g_NosEnabled_pp  = nullptr;
+struct RValue {
+    union {
+        double  val;
+        int32_t i32;
+        void*   ptr;
+    };
+    int32_t flags;  // offset 8
+    int32_t kind;   // offset 12  (0=real, 1=string, 2=array)
+};
 
+// ============================================================
+// GMS2 Variable Descriptor (g_VAR_xxx = 16 bytes)
+// offset 8 = slot index
+// ============================================================
+struct GMS2VarDesc {
+    int32_t hash;
+    int32_t type;
+    int32_t slot;   // ← index ke global variable array
+    int32_t flags;
+};
+
+// ============================================================
+// Function pointers — dari readelf
+// _Z22Variable_Global_GetVariiP6RValuebb @ 0x9fd4c4
+// _Z22Variable_Global_SetVariiP6RValue   @ 0x9fd408
+// ============================================================
+typedef void (*FnGetVar)(int slot, int unk, RValue* out, bool b1, bool b2);
+typedef void (*FnSetVar)(int slot, int unk, RValue* val);
+
+static FnGetVar g_fnGetVar = nullptr;
+static FnSetVar g_fnSetVar = nullptr;
+
+// ============================================================
+// Descriptors & slots
+// ============================================================
+static GMS2VarDesc* g_desc_RPM      = nullptr;
+static GMS2VarDesc* g_desc_gear     = nullptr;
+static GMS2VarDesc* g_desc_speed    = nullptr;
+static GMS2VarDesc* g_desc_shiftup  = nullptr;
+static GMS2VarDesc* g_desc_shiftdn  = nullptr;
+static GMS2VarDesc* g_desc_nos      = nullptr;
+
+static int32_t g_slot_RPM     = -1;
+static int32_t g_slot_gear    = -1;
+static int32_t g_slot_speed   = -1;
+static int32_t g_slot_shiftup = -1;
+static int32_t g_slot_shiftdn = -1;
+static int32_t g_slot_nos     = -1;
+
+// Mod state
 static bool  g_AutoShift     = false;
 static float g_ShiftRPM      = 9300.0f;
 static int   g_ShiftMode     = 0;
@@ -34,99 +75,35 @@ static float g_Shift3to4     = 9400.0f;
 static float g_Shift4to5     = 9500.0f;
 static float g_Shift5to6     = 9500.0f;
 
-// Offset yang bekerja (ditemukan dari scan)
-static int g_RPM_offset  = -1;
-static int g_Gear_offset = -1;
-
 static bool  g_RaceStarted   = false;
 static int   g_PrevGear      = 0;
 static long  g_LastShiftTime = 0;
 static long  g_LastRpmLog    = 0;
-static long  g_LastScan      = 0;
-static bool  g_ScanDone      = false;
 
 static pthread_t g_Thread;
 static bool g_ThreadRunning  = false;
 
 // ============================================================
-// Baca double dari void* + offset
+// Read / Write via official GMS2 functions
 // ============================================================
-static double readDouble(void** pp, int offset) {
-    if (!pp || !*pp) return -1.0;
-    uint8_t* base = (uint8_t*)(*pp);
-    double v;
-    __builtin_memcpy(&v, base + offset, sizeof(double));
-    return v;
+static double readVar(int32_t slot) {
+    if (!g_fnGetVar || slot < 0) return 0.0;
+    RValue out = {};
+    g_fnGetVar(slot, 0, &out, false, false);
+    return out.val;
 }
 
-static void writeDouble(void** pp, int offset, double val) {
-    if (!pp || !*pp) return;
-    uint8_t* base = (uint8_t*)(*pp);
-    __builtin_memcpy(base + offset, &val, sizeof(double));
+static void writeVar(int32_t slot, double val) {
+    if (!g_fnSetVar || slot < 0) return;
+    RValue rv = {};
+    rv.val  = val;
+    rv.kind = 0;
+    g_fnSetVar(slot, 0, &rv);
 }
 
-// ============================================================
-// Scan semua offset untuk cari RPM yang masuk akal
-// RPM valid: 500 - 12000
-// Gear valid: 1 - 6
-// ============================================================
-static void scanOffsets() {
-    if (!g_RPM_pp || !*g_RPM_pp) {
-        LSCN("g_RPM_pp null, skip scan");
-        return;
-    }
-
-    LSCN("=== OFFSET SCAN ===");
-    LSCN("g_RPM_pp=%p  *g_RPM_pp=%p", g_RPM_pp, *g_RPM_pp);
-
-    int offsets[] = {0, 4, 8, 12, 16, 20, 24, 32, 40, 48};
-    for (int i = 0; i < 10; i++) {
-        int off = offsets[i];
-        double d = readDouble(g_RPM_pp, off);
-        float  f;
-        uint8_t* base = (uint8_t*)(*g_RPM_pp);
-        __builtin_memcpy(&f, base + off, sizeof(float));
-        int32_t iv;
-        __builtin_memcpy(&iv, base + off, sizeof(int32_t));
-
-        LSCN("RPM off+%02d: double=%.2f float=%.2f int=%d", off, d, f, iv);
-
-        // Auto-detect offset RPM
-        if (d >= 500.0 && d <= 12000.0 && g_RPM_offset == -1) {
-            g_RPM_offset = off;
-            LSCN("*** RPM offset FOUND: +%d (val=%.1f) ***", off, d);
-        }
-    }
-
-    // Scan gear juga
-    if (g_CurrentGear_pp && *g_CurrentGear_pp) {
-        LSCN("--- GEAR SCAN ---");
-        uint8_t* base = (uint8_t*)(*g_CurrentGear_pp);
-        for (int i = 0; i < 10; i++) {
-            int off = offsets[i];
-            double d = readDouble(g_CurrentGear_pp, off);
-            int32_t iv;
-            __builtin_memcpy(&iv, base + off, sizeof(int32_t));
-            LSCN("GEAR off+%02d: double=%.2f int=%d", off, d, iv);
-
-            if (d >= 1.0 && d <= 6.0 && g_Gear_offset == -1) {
-                g_Gear_offset = off;
-                LSCN("*** GEAR offset FOUND: +%d (val=%.1f) ***", off, d);
-            }
-        }
-    }
-    LSCN("=== END SCAN ===");
-}
-
-static float getRPM() {
-    if (g_RPM_offset < 0) return 0.0f;
-    return (float) readDouble(g_RPM_pp, g_RPM_offset);
-}
-
-static int getGear() {
-    if (g_Gear_offset < 0) return 0;
-    return (int) readDouble(g_CurrentGear_pp, g_Gear_offset);
-}
+static float getRPM()   { return (float)readVar(g_slot_RPM); }
+static int   getGear()  { return (int)  readVar(g_slot_gear); }
+static float getSpeed() { return (float)readVar(g_slot_speed); }
 
 // ============================================================
 // Init
@@ -138,17 +115,32 @@ static bool initSymbols() {
     if (!lib) { LOGI("dlopen FAILED: %s", dlerror()); return false; }
     LOGI("dlopen OK: %p", lib);
 
-    g_RPM_pp         = (void**) dlsym(lib, "g_VAR_RPM");
-    g_CurrentGear_pp = (void**) dlsym(lib, "g_VAR_currentgear");
-    g_CarSpeed_pp    = (void**) dlsym(lib, "g_VAR_car_speed");
-    g_VkShiftUp_pp   = (void**) dlsym(lib, "g_VAR_vk_Shiftup");
-    g_VkShiftDown_pp = (void**) dlsym(lib, "g_VAR_vk_Shiftdown");
-    g_NosEnabled_pp  = (void**) dlsym(lib, "g_VAR_nos_enabled");
+    // Fungsi getter/setter
+    g_fnGetVar = (FnGetVar) dlsym(lib, "_Z22Variable_Global_GetVariiP6RValuebb");
+    g_fnSetVar = (FnSetVar) dlsym(lib, "_Z22Variable_Global_SetVariiP6RValue");
+    LOGI("fnGetVar=%p fnSetVar=%p", g_fnGetVar, g_fnSetVar);
 
-    LOGI("g_RPM_pp=%p -> *=%p", g_RPM_pp, g_RPM_pp ? *g_RPM_pp : nullptr);
-    LOGI("g_Gear_pp=%p -> *=%p", g_CurrentGear_pp, g_CurrentGear_pp ? *g_CurrentGear_pp : nullptr);
+    // Descriptors
+    g_desc_RPM     = (GMS2VarDesc*) dlsym(lib, "g_VAR_RPM");
+    g_desc_gear    = (GMS2VarDesc*) dlsym(lib, "g_VAR_currentgear");
+    g_desc_speed   = (GMS2VarDesc*) dlsym(lib, "g_VAR_car_speed");
+    g_desc_shiftup = (GMS2VarDesc*) dlsym(lib, "g_VAR_vk_Shiftup");
+    g_desc_shiftdn = (GMS2VarDesc*) dlsym(lib, "g_VAR_vk_Shiftdown");
+    g_desc_nos     = (GMS2VarDesc*) dlsym(lib, "g_VAR_nos_enabled");
 
-    return g_RPM_pp != nullptr;
+    // Baca slot dari descriptor
+    if (g_desc_RPM)     g_slot_RPM     = g_desc_RPM->slot;
+    if (g_desc_gear)    g_slot_gear    = g_desc_gear->slot;
+    if (g_desc_speed)   g_slot_speed   = g_desc_speed->slot;
+    if (g_desc_shiftup) g_slot_shiftup = g_desc_shiftup->slot;
+    if (g_desc_shiftdn) g_slot_shiftdn = g_desc_shiftdn->slot;
+    if (g_desc_nos)     g_slot_nos     = g_desc_nos->slot;
+
+    LOGI("slots: RPM=%d gear=%d speed=%d shiftup=%d shiftdn=%d nos=%d",
+         g_slot_RPM, g_slot_gear, g_slot_speed,
+         g_slot_shiftup, g_slot_shiftdn, g_slot_nos);
+
+    return g_fnGetVar != nullptr && g_fnSetVar != nullptr && g_desc_RPM != nullptr;
 }
 
 static long currentTimeMs() {
@@ -157,44 +149,47 @@ static long currentTimeMs() {
     return (long)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
 }
 
+static float getTargetRPM(int gear) {
+    if (g_ShiftMode == 0) return g_ShiftRPM;
+    switch (gear) {
+        case 1: return g_Shift1to2;
+        case 2: return g_Shift2to3;
+        case 3: return g_Shift3to4;
+        case 4: return g_Shift4to5;
+        case 5: return g_Shift5to6;
+        default: return g_ShiftRPM;
+    }
+}
+
 // ============================================================
 // Tick
 // ============================================================
 static void tick() {
-    long now = currentTimeMs();
-
-    // Scan tiap 3 detik sampai offset ditemukan, maks 5x
-    static int scanCount = 0;
-    if (!g_ScanDone && now - g_LastScan >= 3000) {
-        scanOffsets();
-        g_LastScan = now;
-        scanCount++;
-        if ((g_RPM_offset >= 0 && g_Gear_offset >= 0) || scanCount >= 5)
-            g_ScanDone = true;
-    }
-
+    long  now   = currentTimeMs();
     float rpm   = getRPM();
     int   gear  = getGear();
+    float speed = getSpeed();
 
     if (now - g_LastRpmLog >= 500) {
-        LRPM("RPM=%.1f GEAR=%d (roff=%d goff=%d)", rpm, gear, g_RPM_offset, g_Gear_offset);
+        LRPM("RPM=%.1f GEAR=%d SPEED=%.1f", rpm, gear, speed);
         g_LastRpmLog = now;
     }
 
-    if (gear == 1 && g_PrevGear == 0) g_RaceStarted = true;
-    if (gear == 0 && g_RaceStarted)   g_RaceStarted = false;
+    if (gear == 1 && g_PrevGear == 0) { g_RaceStarted = true;  LOGI("RACE START"); }
+    if (gear == 0 && g_RaceStarted)   { g_RaceStarted = false; LOGI("RACE END"); }
     g_PrevGear = gear;
 
-    if (!g_AutoShift || !g_RaceStarted || g_RPM_offset < 0) return;
+    if (!g_AutoShift || !g_RaceStarted) return;
     if (gear < 1 || gear >= 6) return;
     if (now - g_LastShiftTime < 300) return;
 
-    float target = (g_ShiftMode == 0) ? g_ShiftRPM : g_ShiftRPM;
+    float target = getTargetRPM(gear);
     if (rpm >= target) {
-        writeDouble(g_VkShiftUp_pp, g_RPM_offset, 1.0); // pakai offset sama dulu
+        LSFT("SHIFT UP! rpm=%.0f gear=%d target=%.0f", rpm, gear, target);
+        writeVar(g_slot_shiftup, 1.0);
         g_LastShiftTime = now;
         usleep(50000);
-        writeDouble(g_VkShiftUp_pp, g_RPM_offset, 0.0);
+        writeVar(g_slot_shiftup, 0.0);
     }
 }
 
@@ -205,8 +200,7 @@ static void* modThread(void*) {
     LOGI("Mod thread starting...");
     sleep(3);
     if (!initSymbols()) { LOGI("initSymbols FAILED"); return nullptr; }
-    g_LastScan = currentTimeMs();
-    LOGI("Mod thread running! Scanning offsets...");
+    LOGI("Mod thread running!");
     while (g_ThreadRunning) {
         tick();
         usleep(16000);
@@ -258,7 +252,7 @@ Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_setManualRPMs(JNIEnv*, jclass
 
 JNIEXPORT void JNICALL
 Java_com_StudioFurukawa_PixelCarRacer_NativeBridge_setNOS(JNIEnv*, jclass, jboolean v) {
-    writeDouble(g_NosEnabled_pp, g_RPM_offset >= 0 ? g_RPM_offset : 0, v ? 1.0 : 0.0);
+    writeVar(g_slot_nos, v ? 1.0 : 0.0);
 }
 
 JNIEXPORT jfloat JNICALL
